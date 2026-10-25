@@ -10,6 +10,9 @@ import { Job } from "@opencode/core/job"
 import { KV } from "@opencode/core/kv"
 import { LocationServiceMap } from "@opencode/core/location-service-map"
 import type { LocationServices } from "@opencode/core/location-services"
+import { ID, VariantID } from "@opencode/core/model"
+import { ModelResolver } from "@opencode/core/model-resolver"
+import { Provider } from "@opencode/core/provider"
 import { Project } from "@opencode/core/project"
 import { ProjectTable } from "@opencode/core/project/sql"
 import { AbsolutePath } from "@opencode/core/schema"
@@ -20,6 +23,7 @@ import { SessionEvent } from "@opencode/core/session/event"
 import { SessionInbox } from "@opencode/core/session/inbox"
 import { SessionMessage } from "@opencode/core/session/message"
 import { SessionRunner } from "@opencode/core/session/runner/index"
+import { SessionRunnerModel } from "@opencode/core/session/runner/model"
 import { SessionInboxTable, SessionTable } from "@opencode/core/session/sql"
 import { SessionStore } from "@opencode/core/session/store"
 import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, LayerMap, Scope } from "effect"
@@ -50,6 +54,24 @@ describe("SessionExecution lifecycle", () => {
     const interrupted = Effect.runSyncExit(Effect.interrupt)
     expect(SessionExecution.terminal(interrupted)).toEqual({ type: "interrupted", reason: "shutdown" })
     expect(SessionExecution.terminal(interrupted, "user")).toEqual({ type: "interrupted", reason: "user" })
+  })
+
+  test("classifies a cause that also carries a failure as failed", () => {
+    // A teardown interrupt can race a genuine failure. Treating any interrupt in the cause as a
+    // deliberate stop would log that failure and then drop it, leaving clients with silence.
+    const mixed = Cause.combine(
+      Cause.fail(
+        new SessionRunnerModel.ModelUnavailableError({
+          providerID: Provider.ID.make("opencode"),
+          modelID: ID.make("gpt-5.5"),
+        }),
+      ),
+      Cause.interrupt(1),
+    )
+    expect(SessionExecution.terminal(Exit.failCause(mixed))).toEqual({
+      type: "failed",
+      error: { type: "provider.no-route", message: "Model unavailable: opencode/gpt-5.5" },
+    })
   })
 
   it.effect("the sweep only lists claimed top-level Sessions", () =>
@@ -138,6 +160,88 @@ describe("SessionExecution lifecycle", () => {
 
       expect(yield* execution.interrupt(sessionID)).toBeTrue()
       yield* execution.awaitIdle(sessionID)
+      expect((yield* claims(database))[sessionID]).toBe(false)
+    }),
+  )
+
+  it.effect("publishes a pre-runner model failure as a durable failed turn", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const sessions = yield* Session.Service
+      const sessionID = Session.ID.make("ses_pre_runner_model_failure")
+      yield* seedSessions(database, [sessionID])
+
+      const failures: SessionEvent.Execution.Failed[] = []
+      yield* bus.project(SessionEvent.Execution.Failed, (event) => Effect.sync(() => void failures.push(event)))
+
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, () =>
+        Effect.fail(
+          new ModelResolver.VariantUnavailableError({
+            providerID: Provider.ID.make("anthropic"),
+            modelID: ID.make("claude-sonnet-4-6"),
+            variant: VariantID.make("high"),
+          }),
+        ),
+      )
+      const execution = Context.get(context, SessionExecution.Service)
+      yield* execution.resume(sessionID).pipe(Effect.exit)
+      yield* execution.awaitIdle(sessionID)
+
+      const error = {
+        type: "provider.no-route",
+        message: "Variant unavailable for anthropic/claude-sonnet-4-6: high",
+      }
+      expect(failures.map((event) => event.data)).toEqual([{ sessionID, error }])
+      expect((yield* sessions.messages({ sessionID })).filter((message) => message.type === "idle")).toMatchObject([
+        { type: "idle", outcome: "failed", error },
+      ])
+      expect((yield* claims(database))[sessionID]).toBe(false)
+    }),
+  )
+
+  it.effect("publishes a failure that races with an interrupt instead of dropping it", () =>
+    Effect.gen(function* () {
+      const database = yield* Database.Service
+      const bus = yield* Bus.Service
+      const sessions = yield* Session.Service
+      const sessionID = Session.ID.make("ses_mixed_terminal")
+      yield* seedSessions(database, [sessionID])
+
+      const failures: SessionEvent.Execution.Failed[] = []
+      const interruptions: SessionEvent.Execution.Interrupted[] = []
+      yield* bus.project(SessionEvent.Execution.Failed, (event) => Effect.sync(() => void failures.push(event)))
+      yield* bus.project(SessionEvent.Execution.Interrupted, (event) =>
+        Effect.sync(() => void interruptions.push(event)),
+      )
+
+      const scope = yield* Scope.make()
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void))
+      const context = yield* buildExecution(scope, () =>
+        Effect.failCause(
+          Cause.combine(
+            Cause.fail(
+              new SessionRunnerModel.ModelUnavailableError({
+                providerID: Provider.ID.make("opencode"),
+                modelID: ID.make("gpt-5.5"),
+              }),
+            ),
+            Cause.interrupt(1),
+          ),
+        ),
+      )
+      const execution = Context.get(context, SessionExecution.Service)
+      yield* execution.resume(sessionID).pipe(Effect.exit)
+      yield* execution.awaitIdle(sessionID)
+
+      const error = { type: "provider.no-route", message: "Model unavailable: opencode/gpt-5.5" }
+      expect(failures.map((event) => event.data)).toEqual([{ sessionID, error }])
+      expect(interruptions).toEqual([])
+      expect((yield* sessions.messages({ sessionID })).filter((message) => message.type === "idle")).toMatchObject([
+        { type: "idle", outcome: "failed", error },
+      ])
       expect((yield* claims(database))[sessionID]).toBe(false)
     }),
   )
