@@ -2137,6 +2137,7 @@ export type AgentInfo = {
   description?: string
   mode: "subagent" | "primary" | "all"
   hidden: boolean
+  native?: boolean
   color?: AgentColor
   steps?: number
   permissions: PermissionRuleset
