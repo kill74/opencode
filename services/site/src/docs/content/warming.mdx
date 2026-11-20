@@ -156,6 +156,21 @@ normal request.
 00:08:30  warming request
 ```
 
+## Archived sessions
+
+Archiving a session stops its warming loop immediately, even before the window
+ends. Requests to an archived session do not schedule warming, and unarchiving
+alone does not restart it. The next normal request does.
+
+```text
+00:00  normal model request
+00:04  warming request
+00:06  session archived; warming stops
+00:08  no warming request
+00:10  session unarchived; still no warming
+00:11  normal model request; warming resumes
+```
+
 ## Requests
 
 A warming request uses the session's current model, agent, instructions, and
